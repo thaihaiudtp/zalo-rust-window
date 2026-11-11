@@ -35,6 +35,7 @@ pub const HOST: &str = "127.0.0.1";
 const EVENT_WAIT: Duration = Duration::from_secs(20);
 /// Events retained for reconnect/catch-up. The renderer only needs the latest
 /// handful; the cap keeps a forgotten tab from growing the queue forever.
+#[cfg(any(not(windows), test))]
 const EVENT_BACKLOG: usize = 2048;
 
 pub fn origin() -> String {
@@ -103,10 +104,12 @@ impl EventBus {
         }
     }
 
+    #[cfg(any(not(windows), test))]
     pub fn publish(&self, event: Value) {
         self.publish_to(None, event);
     }
 
+    #[cfg(any(not(windows), test))]
     pub fn publish_to(&self, page: Option<&str>, event: Value) {
         let (lock, cvar) = &*self.inner;
         let mut state = lock.lock().unwrap_or_else(|poison| poison.into_inner());

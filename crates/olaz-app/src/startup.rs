@@ -1,6 +1,8 @@
 //! Locating (and, when needed, installing) the official Zalo runtime.
 
-use std::path::{Path, PathBuf};
+#[cfg(not(windows))]
+use std::path::Path;
+use std::path::PathBuf;
 
 use olaz_core::runtime::Runtime;
 
@@ -70,6 +72,7 @@ pub fn load_runtime() -> anyhow::Result<Runtime> {
 }
 
 /// Typical Windows install of the official runtime, reachable from WSL.
+#[cfg(not(windows))]
 pub fn windows_runtime_dir() -> Option<PathBuf> {
     let candidates = [
         "/mnt/c/Users/Admin/AppData/Local/Olaz/ZaloRuntime/current",

@@ -3,7 +3,6 @@
 //! main process. Both the asynchronous WebView2 bridge and the blocking
 //! `/__olaz/bridge-sync` endpoint call these handlers.
 
-use std::path::Path;
 use std::sync::Mutex;
 
 use serde_json::{json, Map, Value};
@@ -18,13 +17,6 @@ pub fn dispatch(
     args: &[Value],
 ) -> HostResult<Value> {
     let p = platform;
-    let host_args;
-    let args = if key.starts_with("$znode.fs") || key.starts_with("$zFileManager.")
-        || key == "$znode.rimraf" || key == "$znode.diskSpace"
-    {
-        host_args = crate::platform::host_arguments(args);
-        host_args.as_slice()
-    } else { args };
     match key {
         // electron-store backing for local-modules.js
         "$zelectron.storePath" => Ok(json!(path_string(
@@ -104,8 +96,11 @@ pub fn dispatch(
         }
         "$znode.fs.unlink"
         | "$znode.fs.unlinkSync"
-        | "$znode.fs.rmdir"
-        | "$znode.fsPromise.unlink"
+        | "$znode.fsPromise.unlink" => {
+            p.unlink(str_arg(args, 0).unwrap_or(""))?;
+            Ok(undefined())
+        }
+        "$znode.fs.rmdir"
         | "$znode.fsPromise.rmdir"
         | "$znode.fsPromise.rm"
         | "$znode.fsExtra.remove"
@@ -136,13 +131,7 @@ pub fn dispatch(
         "$znode.fs.link" | "$znode.fsPromise.link" => {
             let from = str_arg(args, 0).unwrap_or("");
             let to = str_arg(args, 1).unwrap_or("");
-            std::fs::hard_link(from, to).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    HostError::code("ENOENT", from)
-                } else {
-                    HostError::from(e)
-                }
-            })?;
+            p.link(from, to)?;
             Ok(undefined())
         }
         "$znode.fs.readFile" => {
@@ -213,7 +202,7 @@ pub fn dispatch(
             let file = if directory.is_empty() {
                 p.user_data.join("z_u.txt")
             } else {
-                Path::new(directory).join("z_u.txt")
+                p.resolve_path(directory)?.join("z_u.txt")
             };
             let bytes = std::fs::read(&file)
                 .map_err(|_| HostError("ENOENT: z_u.txt not found".into()))?;
@@ -231,12 +220,7 @@ pub fn dispatch(
             let name = str_arg(args, 0).unwrap_or("z.log");
             let directory = p.user_data.join("cal");
             let _ = std::fs::create_dir_all(&directory);
-            let file = directory.join(
-                Path::new(name)
-                    .file_name()
-                    .map(|n| n.to_os_string())
-                    .unwrap_or_else(|| "z.log".into()),
-            );
+            let file = directory.join(log_basename(name)?);
             let bytes = crypto::bytes_value(args.get(1), None)?;
             let overwrite = args
                 .get(2)
@@ -259,12 +243,7 @@ pub fn dispatch(
         "$zFileManager.readZLog" => {
             let directory = p.user_data.join("cal");
             let name = str_arg(args, 0).unwrap_or("");
-            let file = directory.join(
-                Path::new(name)
-                    .file_name()
-                    .map(|n| n.to_os_string())
-                    .unwrap_or_default(),
-            );
+            let file = directory.join(log_basename(name)?);
             match std::fs::read(&file) {
                 Ok(bytes) => Ok(Value::String(String::from_utf8_lossy(&bytes).into_owned())),
                 Err(_) => Ok(Value::Null),
@@ -322,9 +301,8 @@ pub fn dispatch(
             }
         }
         "$zFileManager.svcStatAsync" => {
-            let meta = std::fs::metadata(str_arg(args, 0).unwrap_or(""))
-                .map_err(|e| HostError::from(e))?;
-            Ok(json!({ "size": meta.len() }))
+            let stat = p.stat(str_arg(args, 0).unwrap_or(""), true)?;
+            Ok(json!({ "size": stat["size"] }))
         }
         "$zFileManager.writeBufferToPath" | "$zFileManager.writeBlobToPath" => {
             let bytes = crypto::bytes_value(args.get(1), None)?;
@@ -392,23 +370,31 @@ pub fn dispatch(
 }
 
 fn disk_usage(platform: &Platform, requested: Option<&str>) -> HostResult<Value> {
-    let mut path = requested.map(std::path::PathBuf::from)
-        .unwrap_or_else(|| platform.user_data.clone());
+    let mut path = match requested {
+        Some(p) if p.len() <= 3 && p.as_bytes().get(1) == Some(&b':') => {
+            #[cfg(not(windows))]
+            { platform.user_data.clone() }
+            #[cfg(windows)]
+            { platform.resolve_path(&format!("{}\\", &p[..2]))? }
+        }
+        Some(p) => platform.resolve_path(p)?,
+        None => platform.user_data.clone(),
+    };
     // The synthetic C: drive of the WSL development harness is backed by the
     // host's data filesystem, not a Windows volume mounted in the renderer.
-    #[cfg(not(windows))]
-    if requested.is_some_and(|p| p.len() <= 3 && p.as_bytes().get(1) == Some(&b':')) {
-        path = platform.user_data.clone();
-    }
-    #[cfg(windows)]
-    if requested.is_some_and(|p| p.len() == 2 && p.ends_with(':')) {
-        path.push("\\");
-    }
     while !path.exists() && path.parent().is_some() { path.pop(); }
     let total = fs2::total_space(&path)?;
     let free = fs2::free_space(&path)?;
     let available = fs2::available_space(&path)?;
     Ok(json!({"total": total, "free": free, "available": available, "used": total.saturating_sub(free)}))
+}
+
+fn log_basename(name: &str) -> HostResult<&str> {
+    let basename = name.rsplit(['/', '\\']).next().unwrap_or("");
+    if matches!(basename, "" | "." | "..") || basename.contains('\0') || basename.contains(':') {
+        return Err(HostError::code("EINVAL", "invalid log filename"));
+    }
+    Ok(basename)
 }
 
 fn undefined() -> Value {

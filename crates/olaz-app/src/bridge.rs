@@ -10,7 +10,7 @@ use std::sync::mpsc::Sender;
 use std::sync::Mutex;
 
 use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 
 use crate::crypto::CryptoState;
 use crate::platform::{path_string, str_arg, HostError, HostResult, Platform};
@@ -155,6 +155,7 @@ struct BridgeTableFile {
 /// cannot do itself, or must do on the UI thread).
 #[derive(Debug)]
 pub enum UiEvent {
+    #[cfg_attr(not(windows), allow(dead_code))] // Native WebView2 callbacks only.
     BridgeResponse { page: String, id: i64, payload: String },
     EmitIpc {
         /// `Some("main" | "login" | "worker")` addresses one page; `None`
@@ -174,8 +175,10 @@ pub enum UiEvent {
     },
     ClearCookies,
     OpenDevTools,
+    #[cfg_attr(not(windows), allow(dead_code))]
     PageStarted(String),
     PageReady(String),
+    #[cfg_attr(not(windows), allow(dead_code))]
     PageFinished(String),
     Quit,
 }
@@ -658,21 +661,6 @@ impl Bridge {
         }
     }
 
-    fn emit_channel(&self, channel: &str, args: Vec<Value>) {
-        let subscribed = self
-            .subscriptions
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .contains(&format!("ipc:{channel}"));
-        if subscribed {
-            self.send_ui(UiEvent::EmitIpc {
-                page: None,
-                channel: channel.to_string(),
-                args,
-            });
-        }
-    }
-
     /// Sends an IPC event to one page (or broadcasts when `page` is `None`).
     /// Used to emulate the main process' `webContents.send` between the main
     /// window and the hidden shared-worker window.
@@ -873,16 +861,6 @@ pub fn main_url(platform: &Platform) -> String {
     server::page_url("index.html", &page_query(platform, true))
 }
 
-/// Sanitizes a JSON value for injection through `JSON.parse(<string>)`.
-pub fn script_payload(value: &Value) -> String {
-    let text = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
-    serde_json::to_string(&text).unwrap_or_else(|_| "\"null\"".to_string())
-}
-
-#[allow(dead_code)]
-fn empty_map() -> Map<String, Value> {
-    Map::new()
-}
 /// Renderer console/error capture, forwarded through the bridge's log channel.
 pub const CONSOLE_SCRIPT: &str = r#"
 (() => {

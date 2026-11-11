@@ -269,7 +269,7 @@ fn run_event_loop(
                         &json!({ "kind": "ipc", "channel": "unload-zlog", "args": [] }),
                     );
                 }
-                UiEvent::PageReady(_) => {}
+                UiEvent::PageReady(url) => tracing::debug!("page bridge ready: {url}"),
                 UiEvent::PageFinished(url) => {
                     if url.contains("/shared-worker.html") {
                         worker_ready = true;

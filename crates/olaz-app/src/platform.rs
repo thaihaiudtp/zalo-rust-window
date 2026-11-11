@@ -5,13 +5,11 @@
 //! Paths are real Windows paths. Olaz keeps its data in its own directory and
 //! never touches the official client's `ZaloData`.
 
-use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use base64::Engine;
 use serde_json::{json, Map, Value};
 
 use crate::crypto::CryptoState;
@@ -102,7 +100,8 @@ impl Platform {
     /// Electron `app.getPath(name)`.
     pub fn path(&self, name: &str) -> PathBuf {
         match name {
-            "userData" | "appData" => self.user_data.clone(),
+            "userData" => self.user_data.clone(),
+            "appData" => self.app_data.clone(),
             "temp" => self.temp.clone(),
             "home" => self.home.clone(),
             "downloads" => self.downloads.clone(),
@@ -179,7 +178,7 @@ impl Platform {
 
     /// Lexical, case-insensitive containment check used for writes.
     pub fn is_writable(&self, path: &str) -> bool {
-        let candidate = normalize_path(&self.user_data.join(path));
+        let Ok(candidate) = self.resolve_path(path) else { return false };
         let candidate = path_key(&candidate);
         for root in [&self.user_data, &self.temp, &self.downloads] {
             let root = path_key(&normalize_path(root));
@@ -192,11 +191,59 @@ impl Platform {
 
     // ---- fs operations -------------------------------------------------
 
+    /// Convert a renderer path to a host path exactly once, before any I/O.
+    /// Relative paths are relative to userData, never the repository/cwd.
+    pub fn resolve_path(&self, path: &str) -> HostResult<PathBuf> {
+        if path.is_empty() || path.contains('\0') {
+            return Err(HostError::code("EINVAL", "empty or invalid file path"));
+        }
+        #[cfg(windows)]
+        let target = {
+            if path.starts_with("C:\\__olaz_wsl__\\") {
+                return Err(HostError::code("EINVAL", "WSL harness path on Windows"));
+            }
+            let path = path.replace('/', "\\");
+            if path.as_bytes().get(1) == Some(&b':')
+                && path.as_bytes().get(2) != Some(&b'\\')
+            {
+                return Err(HostError::code("EINVAL", "drive-relative file path"));
+            }
+            let target = PathBuf::from(path);
+            if target.has_root() && !target.is_absolute() {
+                return Err(HostError::code("EINVAL", "path has no drive"));
+            }
+            target
+        };
+        #[cfg(not(windows))]
+        let target = {
+            let path = path.replace('\\', "/");
+            let host = if let Some(tail) = path.strip_prefix("C:/__olaz_wsl__/") {
+                format!("/{tail}")
+            } else if path.as_bytes().get(1) == Some(&b':') {
+                if !path.as_bytes()[0].is_ascii_alphabetic()
+                    || path.as_bytes().get(2) != Some(&b'/')
+                {
+                    return Err(HostError::code("EINVAL", "drive-relative file path"));
+                }
+                format!("/mnt/{}/{}", path[..1].to_ascii_lowercase(), &path[3..])
+            } else if path.starts_with("//") {
+                return Err(HostError::code("ENOTSUP", "UNC path in WSL harness"));
+            } else {
+                // Also accepts old cached `\home\...` harness paths.
+                path
+            };
+            PathBuf::from(host)
+        };
+        let absolute = if target.is_absolute() { target } else { self.user_data.join(target) };
+        Ok(normalize_path(&absolute))
+    }
+
     pub fn stat(&self, path: &str, follow: bool) -> HostResult<Value> {
+        let target = self.resolve_path(path)?;
         let meta = if follow {
-            fs::metadata(path).map_err(|e| missing(e, path))?
+            fs::metadata(&target).map_err(|e| missing(e, path))?
         } else {
-            fs::symlink_metadata(path).map_err(|e| missing(e, path))?
+            fs::symlink_metadata(&target).map_err(|e| missing(e, path))?
         };
         let file_type = meta.file_type();
         let mtime = meta
@@ -228,12 +275,12 @@ impl Platform {
     }
 
     pub fn exists(&self, path: &str) -> bool {
-        Path::new(path).exists()
+        self.resolve_path(path).is_ok_and(|path| path.exists())
     }
 
     pub fn read_dir(&self, path: &str) -> HostResult<Value> {
         let mut names = Vec::new();
-        for entry in fs::read_dir(path).map_err(|e| missing(e, path))? {
+        for entry in fs::read_dir(self.resolve_path(path)?).map_err(|e| missing(e, path))? {
             let entry = entry.map_err(HostError::from)?;
             names.push(entry.file_name().to_string_lossy().into_owned());
         }
@@ -242,59 +289,57 @@ impl Platform {
     }
 
     pub fn mkdir(&self, path: &str, recursive: bool) -> HostResult<()> {
-        let target = Path::new(path);
+        let target = self.writable(path)?;
         if target.is_dir() {
             return Ok(());
         }
         if recursive {
-            fs::create_dir_all(self.writable(path)?)?;
+            fs::create_dir_all(&target)?;
         } else {
-            fs::create_dir(self.writable(path)?)?;
+            fs::create_dir(&target)?;
         }
         Ok(())
     }
 
     pub fn unlink(&self, path: &str) -> HostResult<()> {
-        let target = Path::new(path);
-        match fs::symlink_metadata(target) {
-            Ok(meta) if meta.is_dir() => fs::remove_dir(target).map_err(HostError::from),
-            Ok(_) => fs::remove_file(target).map_err(HostError::from),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(HostError::from(error)),
-        }
+        let target = self.writable(path)?;
+        fs::remove_file(&target).map_err(|e| missing(e, path))
     }
 
     pub fn remove_all(&self, path: &str) -> HostResult<()> {
-        let target = Path::new(path);
-        match fs::symlink_metadata(target) {
-            Ok(meta) if meta.is_dir() => fs::remove_dir_all(target).map_err(HostError::from),
-            Ok(_) => fs::remove_file(target).map_err(HostError::from),
+        let target = self.writable(path)?;
+        match fs::symlink_metadata(&target) {
+            Ok(meta) if meta.is_dir() => fs::remove_dir_all(&target).map_err(HostError::from),
+            Ok(_) => fs::remove_file(&target).map_err(HostError::from),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(HostError::from(error)),
         }
     }
 
     pub fn rename(&self, from: &str, to: &str) -> HostResult<()> {
+        let from = self.writable(from)?;
         let to = self.writable(to)?;
-        if Path::new(&to).exists() {
-            self.remove_all(&to)?;
+        if from == to { return Ok(()); }
+        if to.exists() {
+            self.remove_all(&to.to_string_lossy())?;
         }
-        if let Some(parent) = Path::new(&to).parent() {
+        if let Some(parent) = to.parent() {
             fs::create_dir_all(parent)?;
         }
-        match fs::rename(from, &to) {
+        match fs::rename(&from, &to) {
             Ok(()) => Ok(()),
             Err(_) => {
-                self.copy(from, &to)?;
-                self.remove_all(from)
+                self.copy(&from.to_string_lossy(), &to.to_string_lossy())?;
+                self.remove_all(&from.to_string_lossy())
             }
         }
     }
 
     pub fn copy(&self, from: &str, to: &str) -> HostResult<()> {
         let to = self.writable(to)?;
-        let source = Path::new(from);
-        let meta = fs::symlink_metadata(source).map_err(|e| missing(e, from))?;
+        let source = self.resolve_path(from)?;
+        if source == to { return Err(HostError::code("EINVAL", "source and destination are the same file")); }
+        let meta = fs::symlink_metadata(&source).map_err(|e| missing(e, from))?;
         let _ = fs::symlink_metadata(&to).map(|existing| {
             if existing.is_dir() {
                 let _ = fs::remove_dir_all(&to);
@@ -303,23 +348,23 @@ impl Platform {
             }
         });
         if meta.is_dir() {
-            copy_dir(source, Path::new(&to))?;
+            copy_dir(&source, &to)?;
         } else {
-            if let Some(parent) = Path::new(&to).parent() {
+            if let Some(parent) = to.parent() {
                 fs::create_dir_all(parent)?;
             }
-            fs::copy(source, &to)?;
+            fs::copy(&source, &to)?;
         }
         Ok(())
     }
 
     pub fn read_file(&self, path: &str) -> HostResult<Vec<u8>> {
-        fs::read(path).map_err(|e| missing(e, path))
+        fs::read(self.resolve_path(path)?).map_err(|e| missing(e, path))
     }
 
     pub fn write_file(&self, path: &str, bytes: &[u8]) -> HostResult<()> {
         let target = self.writable(path)?;
-        if let Some(parent) = Path::new(&target).parent() {
+        if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::write(&target, bytes)?;
@@ -329,7 +374,7 @@ impl Platform {
     pub fn append_file(&self, path: &str, bytes: &[u8]) -> HostResult<()> {
         use std::io::Write;
         let target = self.writable(path)?;
-        if let Some(parent) = Path::new(&target).parent() {
+        if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
         let mut file = fs::OpenOptions::new().create(true).append(true).open(&target)?;
@@ -337,9 +382,14 @@ impl Platform {
         Ok(())
     }
 
-    fn writable(&self, path: &str) -> HostResult<String> {
+    pub fn link(&self, from: &str, to: &str) -> HostResult<()> {
+        fs::hard_link(self.resolve_path(from)?, self.writable(to)?)?;
+        Ok(())
+    }
+
+    fn writable(&self, path: &str) -> HostResult<PathBuf> {
         if self.is_writable(path) {
-            Ok(path.to_string())
+            self.resolve_path(path)
         } else {
             Err(HostError::code("EACCES", path))
         }
@@ -410,22 +460,6 @@ pub fn path_string(path: &Path) -> String {
     text
 }
 
-/// Reverse only our synthetic WSL prefix; ordinary strings and Windows builds
-/// are untouched. File operations still run through the usual write sandbox.
-pub fn host_arguments(args: &[Value]) -> Vec<Value> {
-    fn translate(value: &Value) -> Value {
-        match value {
-            #[cfg(not(windows))]
-            Value::String(text) if text.starts_with("C:\\__olaz_wsl__\\") =>
-                json!(text.trim_start_matches("C:\\__olaz_wsl__").replace('\\', "/")),
-            Value::Array(items) => Value::Array(items.iter().map(translate).collect()),
-            Value::Object(map) => Value::Object(map.iter().map(|(key, value)| (key.clone(), translate(value))).collect()),
-            _ => value.clone(),
-        }
-    }
-    args.iter().map(translate).collect()
-}
-
 /// The MVP has no SQLite/DAL backend. The official renderer defaults new
 /// accounts to SQLite even when `sqlite-available` is false. Keep the persisted
 /// adapter selectors on IDB, as the macOS IndexedDB host does, without touching
@@ -447,13 +481,83 @@ fn normalize_database_config(value: &mut Value) {
 mod database_config_tests {
     use super::*;
 
+    pub(crate) fn platform_at(base: &Path) -> Platform {
+        Platform {
+            user_data: base.join("data"), app_data: base.join("data"),
+            home: base.to_path_buf(), temp: base.join("temp"),
+            downloads: base.join("downloads"), desktop: base.join("desktop"),
+            documents: base.join("documents"), pictures: base.join("pictures"),
+            app_path: base.join("runtime"), app_version: "test".into(),
+            client_type: "24".into(), client_version: "696".into(),
+        }
+    }
+
     #[cfg(not(windows))]
     #[test]
     fn harness_paths_round_trip() {
+        let p = platform_at(Path::new("/tmp/olaz-path-test"));
         let rendered = path_string(Path::new("/home/test/Olaz/file.txt"));
         assert!(rendered.starts_with("C:\\"));
-        assert_eq!(host_arguments(&[json!(rendered)]), vec![json!("/home/test/Olaz/file.txt")]);
-        assert_eq!(host_arguments(&[json!("ordinary data")]), vec![json!("ordinary data")]);
+        assert_eq!(p.resolve_path(&rendered).unwrap(), PathBuf::from("/home/test/Olaz/file.txt"));
+        assert_eq!(p.resolve_path(r"\home\test\Olaz\file.txt").unwrap(), PathBuf::from("/home/test/Olaz/file.txt"));
+        assert_eq!(p.resolve_path(r"C:\Users\test\photo.png").unwrap(), PathBuf::from("/mnt/c/Users/test/photo.png"));
+    }
+
+    #[test]
+    fn relative_writes_are_resolved_under_user_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let p = platform_at(temp.path());
+        let name = r"Zalo Data\media\test.txt";
+        p.write_file(name, b"payload").unwrap();
+        assert_eq!(fs::read(p.user_data.join("Zalo Data/media/test.txt")).unwrap(), b"payload");
+        assert_eq!(p.read_file(name).unwrap(), b"payload");
+        assert!(p.exists(name));
+        assert_eq!(p.stat(name, true).unwrap()["size"], 7);
+        p.rename(name, r"Zalo Data\media\renamed.txt").unwrap();
+        p.rename(r"Zalo Data\media\renamed.txt", r"Zalo Data\media\renamed.txt").unwrap();
+        assert!(p.copy(r"Zalo Data\media\renamed.txt", r"Zalo Data\media\renamed.txt").is_err());
+        assert_eq!(p.read_file(r"Zalo Data\media\renamed.txt").unwrap(), b"payload");
+        p.copy(r"Zalo Data\media\renamed.txt", r"Zalo Data\copy.txt").unwrap();
+        p.remove_all(r"Zalo Data\media").unwrap();
+        assert!(!p.exists(name));
+        assert!(p.exists(r"Zalo Data\copy.txt"));
+        p.unlink(r"Zalo Data\copy.txt").unwrap();
+        assert!(!p.exists(r"Zalo Data\copy.txt"));
+        assert!(!p.is_writable(r"..\outside.txt"));
+        assert!(p.write_file(r"..\outside.txt", b"no").is_err());
+        assert!(p.remove_all(r"..\outside.txt").is_err());
+        assert!(p.resolve_path("").is_err());
+        assert!(p.resolve_path("C:relative").is_err());
+    }
+
+    #[test]
+    fn write_recent_id_uses_real_host_path_and_preserves_contents() {
+        let temp = tempfile::tempdir().unwrap();
+        let p = platform_at(temp.path());
+        fs::create_dir_all(&p.user_data).unwrap();
+        let state = std::sync::Mutex::new(CryptoState::default());
+        // A Windows-shaped string in the payload is data, NOT a path argument.
+        let payload = r"C:\do-not-translate\id";
+        crate::local::dispatch(&p, &state, "$zFileManager.writeRecentId", &[json!(payload)]).unwrap();
+        assert_eq!(fs::read_to_string(p.user_data.join("z_u.txt")).unwrap(), payload);
+        let result = crate::local::dispatch(&p, &state, "$zFileManager.getViewerkey", &[json!(path_string(&p.user_data))]).unwrap();
+        assert_eq!(result, payload);
+        crate::local::dispatch(&p, &state, "$znode.fs.writeFile", &[json!("payload.txt"), json!(payload)]).unwrap();
+        assert_eq!(p.read_file("payload.txt").unwrap(), payload.as_bytes());
+    }
+
+    #[test]
+    fn windows_log_names_are_portable_and_confined() {
+        let temp = tempfile::tempdir().unwrap();
+        let p = platform_at(temp.path());
+        let state = std::sync::Mutex::new(CryptoState::default());
+        let name = r"C:\__olaz_wsl__\home\test\ZaloData\cal\render.meta";
+        crate::local::dispatch(&p, &state, "$zFileManager.writeZLog", &[json!(name), json!("log data")]).unwrap();
+        assert_eq!(fs::read_to_string(p.user_data.join("cal/render.meta")).unwrap(), "log data");
+        assert_eq!(fs::read_dir(p.user_data.join("cal")).unwrap().count(), 1);
+        let result = crate::local::dispatch(&p, &state, "$zFileManager.readZLog", &[json!(name)]).unwrap();
+        assert_eq!(result, "log data");
+        assert!(crate::local::dispatch(&p, &state, "$zFileManager.writeZLog", &[json!(".."), json!("no")]).is_err());
     }
 
     #[test]
@@ -605,20 +709,4 @@ pub fn int_arg(args: &[Value], index: usize) -> Option<i64> {
 
 pub fn bool_arg(args: &[Value], index: usize) -> Option<bool> {
     args.get(index).and_then(Value::as_bool)
-}
-
-/// Decodes `{__bytes: base64}` as produced by `bridge.js`.
-pub fn bytes_at(args: &[Value], index: usize) -> Option<Vec<u8>> {
-    let value = args.get(index)?;
-    let mut map = HashMap::new();
-    if let Value::Object(obj) = value {
-        if let Some(encoded) = obj.get("__bytes").and_then(Value::as_str) {
-            map.insert("bytes", encoded.to_string());
-        }
-    }
-    map.get("bytes").and_then(|encoded| {
-        base64::engine::general_purpose::STANDARD
-            .decode(encoded.as_bytes())
-            .ok()
-    })
 }

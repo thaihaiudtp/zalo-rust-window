@@ -1,6 +1,9 @@
 # macOS
 .DS_Store
 
+# Rust build output
+/target/
+
 # SwiftPM / Xcode build output
 .build/
 build/
