@@ -1,0 +1,21 @@
+[package]
+name = "olaz-core"
+description = "Runtime extraction, ASAR access and shared host services for Olaz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+dirs.workspace = true
+memmap2.workspace = true
+nsis.workspace = true
+percent-encoding.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sevenz-rust2.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

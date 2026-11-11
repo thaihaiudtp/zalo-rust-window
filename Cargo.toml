@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = ["crates/olaz-core", "crates/olaz-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/thaiha/zalo-rust-window"
+rust-version = "1.85"
+
+[workspace.dependencies]
+aes = "0.8"
+aes-gcm = "0.10"
+anyhow = "1"
+base64 = "0.22"
+cbc = { version = "0.1", features = ["alloc"] }
+cookie = "0.18"
+ctr = "0.9"
+dirs = "6"
+ecb = { version = "0.1", features = ["alloc"] }
+fs2 = "0.4"
+getrandom = "0.2"
+hkdf = "0.12"
+hmac = "0.12"
+md-5 = "0.10"
+memmap2 = "0.9"
+nsis = "0.6"
+percent-encoding = "2"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sevenz-rust2 = "0.25"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tiny_http = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+tao = "0.37"
+wry = { version = "0.57", features = ["devtools"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+# Keep debug builds usable on the ~180 MB ASAR and installer.
+opt-level = 1
